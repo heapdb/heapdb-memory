@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+# runtime state, downloaded datasets and models (never committed)
+.heapdb-memory/
+.cache/
+*.onnx
+locomo10.json

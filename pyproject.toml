@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "heapdb-memory"
+version = "0.1.0"
+description = "Long-term memory for AI agents on HeapDB: explainable recall that learns which memories are actually useful."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+dependencies = [
+    "heapdb @ git+https://github.com/heapdb/heapdb-core",
+]
+keywords = ["ai-agents", "memory", "llm", "mcp", "retrieval", "bm25", "langgraph", "llamaindex", "heapdb"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database",
+]
+
+[project.optional-dependencies]
+mcp = ["mcp>=1.2"]
+langgraph = ["langgraph>=0.2.40"]
+llamaindex = ["llama-index-core>=0.12.35"]
+embeddings = ["sentence-transformers>=2.2"]
+onnx = ["onnxruntime>=1.16", "tokenizers>=0.15", "numpy>=1.24"]
+test = ["pytest>=7"]
+all = ["heapdb-memory[mcp,langgraph,llamaindex,onnx,test]"]
+
+[project.scripts]
+heapdb-memory-mcp = "heapdb_memory.mcp_server:main"
+
+[project.urls]
+Homepage = "https://github.com/heapdb/heapdb-memory"
+Core = "https://github.com/heapdb/heapdb-core"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["heapdb_memory"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
