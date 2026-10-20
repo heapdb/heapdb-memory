@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
-    "heapdb @ git+https://github.com/heapdb/heapdb-core",
+    "heapdb>=0.5,<0.6",
 ]
 keywords = ["ai-agents", "memory", "llm", "mcp", "retrieval", "bm25", "langgraph", "llamaindex", "heapdb"]
 classifiers = [

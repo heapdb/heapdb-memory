@@ -1,0 +1,52 @@
+name: Release
+
+# Publishes heapdb-memory to PyPI when a tag vX.Y.Z is pushed, using trusted
+# publishing (OIDC, no API token). One-time PyPI setup: a (pending) trusted
+# publisher for project "heapdb-memory" with owner heapdb, repository
+# heapdb-memory, workflow release.yml, environment pypi.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Tag matches package version
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          [ "$want" = "$have" ] || { echo "::error::tag v$want but pyproject.toml has $have"; exit 1; }
+      - name: Test against the published heapdb
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[mcp,langgraph,llamaindex,test]"
+          pytest -q
+      - name: Build sdist and wheel
+        run: |
+          pip install build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/heapdb-memory/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

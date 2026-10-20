@@ -38,7 +38,7 @@ memories that keep paying off stay fresh.
 ## Install
 
 ```bash
-pip install "heapdb-memory[mcp] @ git+https://github.com/heapdb/heapdb-memory"
+pip install "heapdb-memory[mcp]"
 # extras: mcp, langgraph, llamaindex, embeddings (sentence-transformers), onnx (local ONNX encoder)
 ```
 
@@ -244,7 +244,7 @@ the ONNX query embedding) in pure Python.
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
-pip install -e ../heapdb-core            # or let pip fetch heapdb from GitHub
+pip install -e ../heapdb-core            # optional: a local heapdb-core checkout (needs Rust); otherwise pip uses the PyPI wheel
 pip install -e ".[mcp,langgraph,llamaindex,onnx,test]"
 pytest
 ```
