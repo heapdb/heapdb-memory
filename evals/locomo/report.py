@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import statistics
+from array import array
 from pathlib import Path
 
 HERE = Path(__file__).parent
@@ -37,6 +39,27 @@ def paired(a: dict, b: dict, metric: str = "MRR", n: int = 10_000, seed: int = 7
     rng = random.Random(seed)
     m = len(d)
     boots = sorted(statistics.fmean(d[rng.randrange(m)] for _ in range(m)) for _ in range(n))
+    return statistics.fmean(d), boots[int(0.025 * n)], boots[int(0.975 * n)]
+
+
+_IDX: dict[tuple[int, int, int], list[array]] = {}
+
+
+def _boot_idx(m: int, n: int, seed: int) -> list[array]:
+    if (m, n, seed) not in _IDX:
+        rng = random.Random(seed)
+        typ = "H" if m < 65536 else "I"
+        _IDX[(m, n, seed)] = [array(typ, [rng.randrange(m) for _ in range(m)]) for _ in range(n)]
+    return _IDX[(m, n, seed)]
+
+
+def boot(d: list[float], n: int = 10_000, seed: int = 7) -> tuple[float, float, float]:
+    """:func:`paired` for a precomputed per-question difference ``d``: the same
+    resamples and the same result, but the resamples are drawn once and reused
+    across comparisons."""
+    m = len(d)
+    g = d.__getitem__
+    boots = sorted(math.fsum(map(g, ix)) / m for ix in _boot_idx(m, n, seed))
     return statistics.fmean(d), boots[int(0.025 * n)], boots[int(0.975 * n)]
 
 
@@ -279,11 +302,393 @@ def analysis(res: dict) -> str:
     return "\n".join(L) + "\n"
 
 
+# -- noisy feedback (noisy_results.json -> NOISY_FEEDBACK.md) ---------------------------
+
+HEAD = ("heapdb+emb+learned+tuned", "bm25+embedding+tuned")
+LEARN = ("abl:bm25+learned", "bm25")
+NOISY_LEARNED = ("abl:bm25+learned", "heapdb+learned+tuned", "heapdb+emb+learned+tuned")
+#: Sweep axes in order of increasing noise, for the "Reading" section.
+AXES = (("miss", "missed citations, counted as ignored", "miss"),
+        ("miss (unmarked)", "missed citations, left unmarked", "miss"),
+        ("false_pos", "false citations", "false_pos"),
+        ("sparse", "sparse feedback (share of training questions with feedback)", "sparse"))
+
+
+class _Noisy:
+    """Seed-averaged per-question metrics and paired comparisons over a sweep."""
+
+    def __init__(self, res: dict) -> None:
+        self.Q = res["questions"]
+        self.S = {s["label"]: s for s in res["settings"]}
+        self._c: dict = {}
+
+    def pq(self, label: str, method: str, metric: str = "MRR") -> list[float]:
+        """Per-question metric averaged over the setting's seeds."""
+        key = (label, method, metric)
+        if key not in self._c:
+            k = int(metric.split("@")[1]) if metric != "MRR" else 0
+            f = ((lambda r, n: 1.0 / min(r) if r else 0.0) if metric == "MRR"
+                 else (lambda r, n: sum(1 for x in r if x <= k) / n))
+            cols = [[f(r, q[2]) for r, q in zip(rs, self.Q)] for rs in self.S[label]["ranks"][method]]
+            self._c[key] = (cols[0] if len(cols) == 1
+                            else [math.fsum(c[i] for c in cols) / len(cols) for i in range(len(self.Q))])
+        return self._c[key]
+
+    def mean(self, label: str, method: str, metric: str = "MRR") -> float:
+        return statistics.fmean(self.pq(label, method, metric))
+
+    def cmp(self, la: str, a: str, lb: str, b: str, cat: str | None = None) -> tuple[float, float, float]:
+        da, db = self.pq(la, a), self.pq(lb, b)
+        d = [x - y for x, y, q in zip(da, db, self.Q) if cat is None or q[1] == cat]
+        return boot(d) if d else (math.nan, math.nan, math.nan)
+
+    def per_seed(self, label: str, a: str, b: str) -> list[float]:
+        rb = statistics.fmean(self.pq(label, b))
+        out = []
+        for rs in self.S[label]["ranks"][a]:
+            out.append(statistics.fmean(1.0 / min(r) if r else 0.0 for r in rs) - rb)
+        return out
+
+
+def _ci(t) -> str:
+    if math.isnan(t[0]):
+        return "-"
+    return f"{t[0]:+.3f} [{t[1]:+.3f}, {t[2]:+.3f}]"
+
+
+def _sig(t) -> str:
+    return "yes" if t[1] > 0 or t[2] < 0 else "no"
+
+
+def noisy(res: dict) -> str:
+    """Render the noisy-feedback sweep. Numbers are computed from ``res``; the
+    qualitative sentences in "Reading" are derived from the confidence
+    intervals, and the threats section was written for the committed sweep."""
+    from .data import CATEGORIES
+    N = _Noisy(res)
+    meta = res["meta"]
+    S = res["settings"]
+    labels = [s["label"] for s in S]
+    nq = len(res["questions"])
+    cats = {CATEGORIES[k]: k for k in CATEGORIES}
+    ref = "oracle" if "oracle" in N.S else labels[0]
+    none = "sparse=0" if "sparse=0" in N.S else None
+    real = next((s["label"] for s in S if s["group"] == "realistic"), None)
+    have_emb = HEAD[0] in res["methods"]
+    head = HEAD if have_emb else ("heapdb+learned+tuned", "bm25")
+    seeds = meta.get("seeds", [])
+    L: list[str] = []
+    L.append("# LoCoMo: learned usefulness under noisy feedback\n")
+    L.append("Generated by `python -m evals.locomo.report --noisy` from `noisy_results.json` "
+             "(produced by `python -m evals.locomo.run --sweep`). Do not edit by hand.\n")
+    L.append(
+        "The LoCoMo results in [RESULTS.md](RESULTS.md) train usefulness on *oracle* feedback: for "
+        "each training question the evidence turns among the top 10 are marked used and the other "
+        "shown turns ignored. A real agent's feedback is what it cites, which is noisier and sparser. "
+        "This sweep keeps everything else fixed (the same leave-one-conversation-out folds, stores, "
+        f"nested-CV tuning grid and {nq} test questions) and only replaces the training feedback "
+        "with a simulated agent. The held-out conversation still gets no feedback.\n")
+    L.append("## Feedback models\n")
+    L.append("Applied per training question to the top 10 it recalled, starting from the oracle:\n")
+    L.append("- `oracle`: evidence turns used, other shown turns ignored (the committed protocol).")
+    L.append("- `miss=p`: each shown evidence turn is independently not cited with probability p "
+             "(the agent forgot to cite it). By default a missed turn counts as *ignored*, because "
+             "an agent that does not cite something signals ignore; `(unmarked)` rows leave it "
+             "without feedback instead.")
+    L.append("- `false_pos=q`: each shown non-evidence turn is independently marked used with "
+             "probability q (the agent cited something irrelevant).")
+    L.append("- `sparse=r`: only a share r of training questions give any feedback; the rest are "
+             "recalled and left unmarked. `sparse=0` is *no feedback at all*: the learned methods "
+             "keep their tuned weights but usefulness stays at the prior. It is the floor that "
+             "separates the effect of learning from that of importance and tuning.")
+    L.append("- `cite_top1`: only the highest-ranked shown evidence turn is marked used, other "
+             "evidence turns are left unmarked, non-evidence turns are ignored (an agent that cites "
+             "one source).")
+    if real:
+        L.append(f"- Combined *realistic* setting: `{real}`.")
+    stress = [x for x in res.get("stress", []) if x in N.S]
+    if stress:
+        L.append("- *Stress* points beyond the planned grid, added to find where the gain breaks: "
+                 + ", ".join(f"`{x}`" for x in stress) + ". They are marked † in the tables.")
+    L.append("")
+    L.append(
+        "Noise is deterministic: each draw is a hash of (seed, conversation, question, turn), so "
+        "a question's feedback is the same in every fold and method, and noise levels are nested "
+        f"(with one seed, what is missed at `miss=0.3` is also missed at `miss=0.5`). Stochastic "
+        f"settings run with seeds {seeds}; deterministic ones (`oracle`, `cite_top1`, `sparse=0`) once.\n")
+    L.append(
+        "**Statistics.** For a stochastic setting each question's reciprocal rank is first averaged "
+        "over the seeds, then the difference to the baseline is bootstrapped over questions (paired, "
+        "10 000 resamples, the same resamples as RESULTS.md). The estimate is the expected ΔMRR "
+        "under that noise model; the CI covers question sampling. Spread across seeds (noise "
+        "realisations) is shown separately. With one seed this is exactly the RESULTS.md bootstrap. "
+        "*Significant* = the 95% CI excludes 0. `bm25` and `bm25+embedding+tuned` do not read "
+        "usefulness, so they are identical under every feedback model (checked).\n")
+
+    # -- headline table
+    L.append("## Robustness\n")
+    hn = f"`{head[0]}` − `{head[1]}`"
+    L.append(f"Headline comparison {hn} (equal relevance, equal tuning; ΔMRR, 95% CI). *Learning vs "
+             f"no feedback* = the same method against itself at `sparse=0` (what the learned "
+             f"usefulness adds); *retained* = that gain as a share of the oracle's. Last column: "
+             f"learned usefulness alone, `{LEARN[0]}` − `bm25`.\n")
+    L.append(f"| feedback | seeds | {hn} | sig | learning vs no feedback | sig | retained | "
+             f"`{LEARN[0]}` − `bm25` | sig |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
+    g0 = N.cmp(ref, head[0], none, head[0])[0] if none else None
+
+    def D(lb: str) -> str:
+        return f"`{lb}` †" if lb in stress else f"`{lb}`"
+
+    for s in S:
+        lb = s["label"]
+        t = N.cmp(lb, head[0], lb, head[1])
+        u = N.cmp(lb, LEARN[0], lb, LEARN[1])
+        if none and lb != none:
+            g = N.cmp(lb, head[0], none, head[0])
+            gl, gs = _ci(g), _sig(g)
+            ret = f"{g[0] / g0:.0%}" if g0 else "-"
+        else:
+            gl, gs, ret = "-", "-", "-"
+        L.append(f"| {D(lb)} | {len(s['seeds'])} | {_ci(t)} | {_sig(t)} | {gl} | {gs} | {ret} | "
+                 f"{_ci(u)} | {_sig(u)} |")
+    L.append("")
+
+    # -- reading
+    def first_break(rows, a, b, against=None):
+        """First row (in order of increasing noise) where ``a`` no longer beats
+        ``b`` significantly; ``against`` = compare ``a`` with itself in that setting."""
+        for s in rows:
+            tt = N.cmp(s["label"], a, against or s["label"], b)
+            if _sig(tt) == "no" or tt[0] <= 0:
+                return s, tt, False
+        tt = N.cmp(rows[-1]["label"], a, against or rows[-1]["label"], b)
+        return rows[-1], tt, True
+
+    def axis_rows(group, key):
+        rows = [s for s in S if s["group"] == group]
+        return sorted(rows, key=lambda s: s["feedback"][key], reverse=(key == "sparse"))
+
+    def say(name, br):
+        s, tt, held = br
+        if held:
+            return f"{name}: significant at every level tested, down to {D(s['label'])} ({_ci(tt)})"
+        return f"{name}: no longer significant at {D(s['label'])} ({_ci(tt)})"
+
+    L.append("## Reading\n")
+    planned = [s for s in S if s["label"] not in stress and s["label"] != none]
+    ns = [s["label"] for s in planned if _sig(N.cmp(s["label"], head[0], s["label"], head[1])) == "no"]
+    worst = min(planned, key=lambda s: N.cmp(s["label"], head[0], s["label"], head[1])[0])
+    tw = N.cmp(worst["label"], head[0], worst["label"], head[1])
+    if not ns:
+        top = (f"**Within the planned grid the gain of `{head[0]}` over `{head[1]}` never stops being "
+               f"significant.** It shrinks with the noise, to {_ci(tw)} at its lowest "
+               f"({D(worst['label'])}).")
+    else:
+        top = (f"**The gain of `{head[0]}` over `{head[1]}` is not significant under "
+               + ", ".join(D(x) for x in ns) + ".**")
+    sb = [x for x in stress if _sig(N.cmp(x, head[0], x, head[1])) == "no"]
+    if stress:
+        top += " Of the stress points, " + (", ".join(D(x) for x in sb) + " break it." if sb
+                                            else "none breaks it.")
+    if none:
+        noisy_rows = [s for s in S if s["label"] not in (ref, none)]
+        if noisy_rows:
+            lw = min(noisy_rows, key=lambda s: N.cmp(s["label"], head[0], none, head[0])[0])
+            gw = N.cmp(lw["label"], head[0], none, head[0])
+            top += (f" The margin cannot fall much below the no-feedback margin (next paragraph), so "
+                    f"the stricter question is whether learning itself still helps: its contribution is "
+                    f"smallest at {D(lw['label'])}, {_ci(gw)}"
+                    + (" (lower bound at or near 0: learning has essentially stopped helping)."
+                       if gw[1] < 0.0015 else "."))
+    L.append(top + "\n")
+    t_ref = N.cmp(ref, head[0], ref, head[1])
+    para = f"With oracle feedback {hn} is {_ci(t_ref)}."
+    if none:
+        t0 = N.cmp(none, head[0], none, head[1])
+        para += (f" With no feedback at all (`sparse=0`) it is {_ci(t0)}"
+                 + (" (significant)" if _sig(t0) == "yes" else " (not significant)")
+                 + ": that part of the margin comes from importance and the tuned weights, not from "
+                 f"learning. Learning adds {g0:+.3f} on top under the oracle. The stricter test of "
+                 "whether noisy learning still works is therefore *learning vs no feedback*.")
+    L.append(para + " Per sweep axis, in order of increasing noise:\n")
+    for group, desc, key in AXES:
+        rows = axis_rows(group, key)
+        if not rows:
+            continue
+        parts = [say("vs the baseline", first_break(rows, head[0], head[1]))]
+        if none:
+            parts.append(say("learning vs no feedback", first_break(rows, head[0], head[0], none)))
+        L.append(f"- **{desc}**: " + "; ".join(parts) + ".")
+    for lb in [x for x in ["cite_top1" if "cite_top1" in N.S else None]
+               + [s["label"] for s in S if s["group"] in ("realistic", "stress")] if x]:
+        tt = N.cmp(lb, head[0], lb, head[1])
+        parts = [f"vs the baseline {_ci(tt)} ({'significant' if _sig(tt) == 'yes' else 'not significant'})"]
+        if none:
+            g = N.cmp(lb, head[0], none, head[0])
+            parts.append(f"learning vs no feedback {_ci(g)} "
+                         f"({'significant' if _sig(g) == 'yes' else 'not significant'}"
+                         + (f", {g[0] / g0:.0%} of the oracle's)" if g0 else ")"))
+        L.append(f"- **{D(lb)}**: " + "; ".join(parts) + ".")
+    if have_emb:
+        lex = []
+        for m in ("abl:bm25+learned", "heapdb+learned+tuned"):
+            if m not in res["methods"]:
+                continue
+            br = []
+            for group, _desc, key in AXES[:1] + AXES[2:]:
+                rows = axis_rows(group, key)
+                if rows:
+                    s_, tt, held = first_break(rows, m, head[1])
+                    br.append(f"{group} " + ("holds through " if held else "breaks at ")
+                              + f"{D(s_['label'])} ({_ci(tt)})")
+            if real:
+                tt = N.cmp(real, m, real, head[1])
+                verdict = "significant" if _sig(tt) == "yes" else "not significant"
+                br.append(f"realistic {_ci(tt)} ({verdict})")
+            lex.append(f"`{m}`: " + "; ".join(br))
+        L.append("- **Lexical rows against the hybrid baseline** (different relevance, so not the "
+                 "headline comparison; with oracle feedback they beat it): " + ". ".join(lex) + ". "
+                 "Without embeddings, learned usefulness alone stops beating hybrid retrieval at moderate "
+                 "miss rates, though it stays above `bm25` (last column of the robustness table).")
+    L.append("")
+
+    # -- all methods
+    L.append("## All methods\n")
+    L.append(f"Seed-averaged MRR and R@5 of the learned methods under each feedback model, ΔMRR vs "
+             f"`bm25` and vs `bm25+embedding+tuned` (95% CI), and the per-seed ΔMRR vs "
+             f"`{head[1]}`. Feedback-free references: "
+             + ", ".join(f"`{b}` MRR {N.mean(ref, b):.3f}, R@5 {N.mean(ref, b, 'R@5'):.3f}"
+                         for b in res["feedback_free"] if b in res["methods"]) + ".\n")
+    base2 = "bm25+embedding+tuned" if have_emb else None
+    L.append("| feedback | method | MRR | R@5 | ΔMRR vs `bm25` | ΔMRR vs `bm25+embedding+tuned` | "
+             f"per-seed Δ vs `{head[1]}` |")
+    L.append("|---|---|---|---|---|---|---|")
+    for s in S:
+        lb = s["label"]
+        for m in NOISY_LEARNED:
+            if m not in res["methods"]:
+                continue
+            a = N.cmp(lb, m, lb, "bm25")
+            b = _ci(N.cmp(lb, m, lb, base2)) if base2 else "-"
+            ps = ", ".join(f"{x:+.3f}" for x in N.per_seed(lb, m, head[1]))
+            L.append(f"| {D(lb)} | `{m}` | {N.mean(lb, m):.3f} | {N.mean(lb, m, 'R@5'):.3f} | {_ci(a)} | "
+                     f"{b} | {ps} |")
+    L.append("")
+
+    # -- per category
+    if real:
+        L.append(f"## Per category: `{real}` vs `{ref}`\n")
+        L.append(f"ΔMRR vs `{head[1]}` by question category (95% CI).\n")
+        L.append("| method | feedback | " + " | ".join(
+            f"{c} (n={meta['questions_per_category'].get(c, '?')})" for c in CATS) + " |")
+        L.append("|---|---|" + "---|" * len(CATS))
+        for m in NOISY_LEARNED:
+            if m not in res["methods"]:
+                continue
+            for lb in (ref, real):
+                L.append(f"| `{m}` | {lb} | " + " | ".join(
+                    _ci(N.cmp(lb, m, lb, head[1], cats[c])) for c in CATS) + " |")
+        L.append("")
+
+    # -- feedback volume
+    L.append("## Feedback volume\n")
+    L.append("Per training pass (one fold's 9 training conversations, about "
+             f"{round(nq * 0.9)} questions), averaged over passes and seeds. *Precision* = share of "
+             "used marks that are evidence turns; *evidence lost* = shown evidence turns not marked "
+             "used.\n")
+    L.append("| feedback | questions with feedback | used | precision | ignored | evidence lost |")
+    L.append("|---|---|---|---|---|---|")
+    for s in S:
+        per = []
+        for st, ev in zip(s["train_feedback_stats"], s["train_feedback_events_per_fold"]):
+            k = max(len(ev), 1)
+            keys = ("questions", "used", "used_evidence", "ignored", "evidence_shown")
+            per.append({x: st.get(x, 0) / k for x in keys})
+        a = {x: statistics.fmean(p[x] for p in per) for x in per[0]}
+        prec = f"{a['used_evidence'] / a['used']:.0%}" if a["used"] else "-"
+        lost = (f"{(a['evidence_shown'] - a['used_evidence']) / a['evidence_shown']:.0%}"
+                if a["evidence_shown"] else "-")
+        L.append(f"| {D(s['label'])} | {a['questions']:.0f} | {a['used']:.0f} | {prec} | "
+                 f"{a['ignored']:.0f} | "
+                 f"{lost} |")
+    L.append("")
+
+    # -- tuning
+    tc = res.get("tuned_choices", {})
+    if tc:
+        nruns = sum(len(s["seeds"]) for s in S)
+        L.append("## Nested-CV tuning\n")
+        L.append(f"Tuning scores the grid on the 9 training conversations without learning, so it "
+                 f"cannot see feedback: the chosen weights were identical in all {nruns} runs (asserted "
+                 "when the sweep is collected), and equal to those in RESULTS.md. Choices per method "
+                 "(number of folds):\n")
+        for m, rows in tc.items():
+            cnt: dict[str, int] = {}
+            for r in rows:
+                p = ", ".join(f"{k}={v:g}" for k, v in r["params"].items())
+                cnt[p] = cnt.get(p, 0) + 1
+            L.append(f"- `{m}`: " + "; ".join(f"{p} ({n})" for p, n in cnt.items()))
+        L.append("")
+
+    # -- threats
+    L.append("## Threats to validity\n")
+    L.append(
+        "- **Simulated, not real, agent feedback.** Errors are independent per turn and uniform: a "
+        "real agent's misses and false citations depend on content and rank. In particular, real "
+        "false citations tend to be plausible distractors (lexically close to the question), which "
+        "would bias the learned features more than uniform noise does. No LLM judge was run.")
+    L.append(
+        "- **The noise is fixed per question.** A training question gets the same feedback in each "
+        "of the 9 folds it trains in. That is how a logged agent would behave, but it means the 3 "
+        "seeds are 3 noise realisations, not 27; the seed spread is in the *All methods* table.")
+    L.append(
+        "- **Usefulness = evidence.** The oracle (and every model here) treats LoCoMo's annotated "
+        "evidence turns as what an agent would use. An agent may legitimately use other turns.")
+    L.append(
+        "- **Feedback only on the top 10**, one query per training question and no repeated "
+        "recalls of the same memory: per-memory links never help on held-out data. In real use "
+        "they would, and they would also absorb per-memory noise.")
+    L.append(
+        "- **Tuning does not adapt to the noise.** Weights (including the usefulness weight, fixed "
+        "at 1) are tuned without learning. A noise-aware tuner might down-weight usefulness when "
+        "feedback is poor, which would make the learned rows more robust than shown here.")
+    L.append(
+        "- **One benchmark, one embedder, small grids**, as in RESULTS.md.\n")
+
+    L.append("## Setup and reproduction\n")
+    emb = meta.get("embedder")
+    L.append(f"- Dataset sha256 `{meta.get('dataset_sha256', '?')}`; {nq} questions; "
+             f"ranking depth {meta.get('depth', '?')}; feedback on the top {meta.get('train_shown', '?')}.")
+    emb_txt = f"all-MiniLM-L6-v2 ONNX, sha256 `{emb['onnx_sha256']}`." if emb else "none (lexical only)."
+    L.append("- Embeddings: " + emb_txt)
+    L.append(f"- {sum(len(s['seeds']) for s in S)} runs; sum of per-run runtimes "
+             f"{meta.get('runtime_s', '?')} s "
+             "(runs were split across parallel processes) "
+             f"(Python {meta.get('python', '?')}, {meta.get('machine', '?')}).")
+    L.append("- `python -m evals.locomo.run --onnx-model DIR --sweep` (resumable; `--shard i/n` "
+             "splits it across processes, then `--sweep --collect`), then "
+             "`python -m evals.locomo.report --noisy`. A single setting: "
+             "`python -m evals.locomo.run --onnx-model DIR --feedback miss=0.5,false_pos=0.1 "
+             "--missed-as ignored --seed 1 --out x.json`.")
+    return "\n".join(L) + "\n"
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--results", type=Path, default=HERE / "results.json")
-    p.add_argument("--out", type=Path, default=HERE / "RESULTS.md")
+    p.add_argument("--results", type=Path)
+    p.add_argument("--out", type=Path)
+    p.add_argument("--noisy", action="store_true",
+                   help="render noisy_results.json into NOISY_FEEDBACK.md instead")
     a = p.parse_args(argv)
+    if a.noisy:
+        res = json.loads((a.results or HERE / "noisy_results.json").read_text())
+        out = a.out or HERE / "NOISY_FEEDBACK.md"
+        out.write_text(noisy(res))
+        print(f"wrote {out}")
+        return 0
+    a.results = a.results or HERE / "results.json"
+    a.out = a.out or HERE / "RESULTS.md"
     res = json.loads(a.results.read_text())
     md = render(res) + "\n" + analysis(res)
     a.out.write_text(md)
