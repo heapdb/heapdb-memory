@@ -56,3 +56,24 @@ the equivalent. The full run takes about one hour on 2 vCPUs, mostly the
 nested-CV tuning.
 
 Results: [RESULTS.md](RESULTS.md).
+
+## Noisy feedback
+
+The committed results train on oracle feedback. `--feedback` swaps in a
+simulated, seeded agent: `miss=p` (evidence not cited; `--missed-as
+ignored|unmarked`), `false_pos=q` (irrelevant turns cited), `sparse=r`
+(share of training questions with any feedback), `cite_top1` (one source
+cited), combinable, e.g. `--feedback miss=0.5,false_pos=0.1,sparse=0.5
+--seed 1 --out x.json`. `--feedback oracle` (the default) reproduces
+`results.json` exactly.
+
+```bash
+python -m evals.locomo.run --onnx-model DIR --sweep --shard 0/2   # and 1/2, in parallel
+python -m evals.locomo.run --onnx-model DIR --sweep --collect     # -> noisy_results.json
+python -m evals.locomo.report --noisy                            # -> NOISY_FEEDBACK.md
+```
+
+The sweep reuses each fold's nested-CV grid evaluation across feedback
+models. Tuning never sees feedback, so the chosen weights are the same in
+every run, and `--collect` asserts that. About 1 h 45 min on 2 vCPUs (two shards).
+Results: [NOISY_FEEDBACK.md](NOISY_FEEDBACK.md).

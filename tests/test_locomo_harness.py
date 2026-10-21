@@ -78,9 +78,9 @@ def test_no_test_leakage(fixture_path, monkeypatch) -> None:
     seen: list[tuple[str, set]] = []
     orig = run.train
 
-    def spy(mem, train_convs, cfg):
+    def spy(mem, train_convs, cfg, *args, **kw):
         seen.append({c.sample_id for c in train_convs})
-        return orig(mem, train_convs, cfg)
+        return orig(mem, train_convs, cfg, *args, **kw)
 
     monkeypatch.setattr(run, "train", spy)
     run.run(convs, None, only={"heapdb+learned"}, log=lambda *_: None)
